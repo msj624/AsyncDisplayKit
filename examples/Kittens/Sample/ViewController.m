@@ -13,18 +13,24 @@
 
 #import <AsyncDisplayKit/AsyncDisplayKit.h>
 #import <AsyncDisplayKit/ASAssert.h>
+#import <BKDeltaCalculator/BKDeltaCalculator.h>
+#import <BKDeltaCalculator/BKDelta.h>
 
 #import "BlurbNode.h"
 #import "KittenNode.h"
 
+#define USE_UIKIT 0
 
-static const NSInteger kLitterSize = 20;
-static const NSInteger kLitterBatchSize = 10;
-static const NSInteger kMaxLitterSize = 100;
 
-@interface ViewController () <ASTableViewDataSource, ASTableViewDelegate>
+static const NSInteger kLitterSize = 5;
+
+@interface ViewController ()
 {
+#if USE_UIKIT
+  UITableView *_tableView;
+#else
   ASTableView *_tableView;
+#endif
 
   // array of boxed CGSizes corresponding to placekitten kittens
   NSArray *_kittenDataSource;
@@ -37,6 +43,14 @@ static const NSInteger kMaxLitterSize = 100;
 
 @end
 
+#if USE_UIKIT
+@interface ViewController (UIKit) <UITableViewDataSource, UITableViewDelegate>
+@end
+#else
+@interface ViewController (ASDisplayKit) <ASTableViewDataSource, ASTableViewDelegate>
+@end
+#endif
+
 
 @implementation ViewController
 
@@ -48,10 +62,17 @@ static const NSInteger kMaxLitterSize = 100;
   if (!(self = [super init]))
     return nil;
 
-  _tableView = [[ASTableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain asyncDataFetching:YES];
-  _tableView.separatorStyle = UITableViewCellSeparatorStyleNone; // KittenNode has its own separator
+#if USE_UIKIT
+    _tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    [_tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"UITableViewCell"];
+#else
+  _tableView = [[ASTableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain asyncDataFetching:NO];
+    // NOTE: (Using Async will cause crash)...
   _tableView.asyncDataSource = self;
   _tableView.asyncDelegate = self;
+#endif
 
   // populate our "data source" with some random kittens
 
@@ -62,15 +83,25 @@ static const NSInteger kMaxLitterSize = 100;
 
 - (NSArray *)createLitterWithSize:(NSInteger)litterSize
 {
-  NSMutableArray *kittens = [NSMutableArray arrayWithCapacity:litterSize];
-  for (NSInteger i = 0; i < litterSize; i++) {
-    u_int32_t deltaX = arc4random_uniform(10) - 5;
-    u_int32_t deltaY = arc4random_uniform(10) - 5;
-    CGSize size = CGSizeMake(350 + 2 * deltaX, 350 + 4 * deltaY);
+    NSMutableArray *kittens = [NSMutableArray arrayWithCapacity:litterSize];
+    for (NSInteger i = 0; i < litterSize; i++) {
+        [kittens addObject:@(i)];
+    }
+    return kittens;
+}
 
-    [kittens addObject:[NSValue valueWithCGSize:size]];
-  }
-  return kittens;
+- (NSArray *)createNewLitterFromLitter:(NSArray *)litter {
+    NSMutableArray *newLitter = [litter mutableCopy];
+    BOOL added = NO;
+    while (!added) {
+        NSNumber *randomNumber = @(arc4random_uniform(10));
+        if (![newLitter containsObject:randomNumber]) {
+            [newLitter insertObject:randomNumber atIndex:0];
+            added = YES;
+        }
+    }
+    [newLitter removeLastObject];
+    return [newLitter copy];
 }
 
 - (void)setKittenDataSource:(NSArray *)kittenDataSource {
@@ -84,6 +115,13 @@ static const NSInteger kMaxLitterSize = 100;
   [super viewDidLoad];
 
   [self.view addSubview:_tableView];
+    
+    UIButton *actionButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    actionButton.backgroundColor = [UIColor redColor];
+    actionButton.frame = CGRectMake(100.0, 0.0, 50.0, 44.0);
+    [actionButton setTitle:@"Action" forState:UIControlStateNormal];
+    [actionButton addTarget:self action:@selector(onAction:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:actionButton];
 }
 
 - (void)viewWillLayoutSubviews
@@ -96,27 +134,79 @@ static const NSInteger kMaxLitterSize = 100;
   return YES;
 }
 
+#pragma mark - Helpers
+
+// Clone of to -[BKDelta applyUpdatesToTableView:inSection:withRowAnimation:]
+- (void)applyDeltaUpdates:(BKDelta *)delta toTableView:(UITableView *)tableView inSection:(NSUInteger)section withRowAnimation:(UITableViewRowAnimation)rowAnimation {
+    NSMutableArray *removedIndexPaths = [NSMutableArray arrayWithCapacity:delta.removedIndices.count];
+    [delta.removedIndices enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+        NSIndexPath *indexPath = [NSIndexPath indexPathForRow:idx inSection:section];
+        [removedIndexPaths addObject:indexPath];
+    }];
+    
+    [tableView deleteRowsAtIndexPaths:removedIndexPaths withRowAnimation:rowAnimation];
+    
+    NSMutableArray *addedIndexPaths = [NSMutableArray arrayWithCapacity:delta.addedIndices.count];
+    [delta.addedIndices enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+        NSIndexPath *indexPath = [NSIndexPath indexPathForRow:idx inSection:section];
+        [addedIndexPaths addObject:indexPath];
+    }];
+    
+    [tableView insertRowsAtIndexPaths:addedIndexPaths withRowAnimation:rowAnimation];
+    
+    // This will work for UITableView...
+    [delta.movedIndexPairs enumerateObjectsUsingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
+        NSNumber *fromIndex = [obj objectAtIndex:0], *toIndex = [obj objectAtIndex:1];
+        NSIndexPath *fromIndexPath = [NSIndexPath indexPathForRow:[fromIndex unsignedIntegerValue] inSection:section];
+        NSIndexPath *toIndexPath = [NSIndexPath indexPathForRow:[toIndex unsignedIntegerValue] inSection:section];
+        [tableView moveRowAtIndexPath:fromIndexPath toIndexPath:toIndexPath];
+    }];
+}
+
+#pragma mark - Actions
+
+- (void)onAction:(id)sender {
+    NSArray *oldDataSource = _kittenDataSource;
+    NSArray *newDataSource = [self createNewLitterFromLitter:oldDataSource];
+    
+    [_tableView beginUpdates];
+    BKDeltaCalculator *deltaCalculator = [BKDeltaCalculator deltaCalculatorWithEqualityTest:^BOOL(id a, id b) {
+        return [a isEqual:b];
+    }];
+    BKDelta *delta = [deltaCalculator deltaFromOldArray:oldDataSource toNewArray:newDataSource];
+    NSLog(@"Added: %@", delta.addedIndices);
+    NSLog(@"Removed: %@", delta.removedIndices);
+    NSLog(@"Moved: %@", delta.movedIndexPairs);
+    
+    _kittenDataSource = newDataSource;
+    [self applyDeltaUpdates:delta toTableView:_tableView inSection:0 withRowAnimation:UITableViewRowAnimationFade];
+    
+    [_tableView endUpdates];
+}
+
 
 #pragma mark -
 #pragma mark Kittens.
 
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSNumber *number = _kittenDataSource[indexPath.row];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"UITableViewCell" forIndexPath:indexPath];
+    cell.textLabel.text = number.stringValue;
+    return cell;
+}
+
 - (ASCellNode *)tableView:(ASTableView *)tableView nodeForRowAtIndexPath:(NSIndexPath *)indexPath
 {
-  // special-case the first row
-  if (indexPath.section == 0 && indexPath.row == 0) {
-    BlurbNode *node = [[BlurbNode alloc] init];
-    return node;
-  }
-
-  NSValue *size = _kittenDataSource[indexPath.row - 1];
-  KittenNode *node = [[KittenNode alloc] initWithKittenOfSize:size.CGSizeValue];
+  NSNumber *number = _kittenDataSource[indexPath.row];
+  ASTextCellNode *node = [[ASTextCellNode alloc] init];
+  node.text = number.stringValue;
   return node;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
   // blurb node + kLitterSize kitties
-  return 1 + _kittenDataSource.count;
+  return _kittenDataSource.count;
 }
 
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath
@@ -133,35 +223,6 @@ static const NSInteger kMaxLitterSize = 100;
 - (void)tableViewUnlockDataSource:(ASTableView *)tableView
 {
   self.dataSourceLocked = NO;
-}
-
-- (BOOL)shouldBatchFetchForTableView:(UITableView *)tableView
-{
-  return _kittenDataSource.count < kMaxLitterSize;
-}
-
-- (void)tableView:(UITableView *)tableView willBeginBatchFetchWithContext:(ASBatchContext *)context
-{
-  NSLog(@"adding kitties");
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-    sleep(1);
-    dispatch_async(dispatch_get_main_queue(), ^{
-      NSArray *moarKittens = [self createLitterWithSize:kLitterBatchSize];
-
-      NSMutableArray *indexPaths = [[NSMutableArray alloc] init];
-      NSInteger existingKittens = _kittenDataSource.count;
-      for (NSInteger i = 0; i < moarKittens.count; i++) {
-        [indexPaths addObject:[NSIndexPath indexPathForRow:existingKittens + i inSection:0]];
-      }
-
-      _kittenDataSource = [_kittenDataSource arrayByAddingObjectsFromArray:moarKittens];
-      [tableView insertRowsAtIndexPaths:indexPaths withRowAnimation:UITableViewRowAnimationFade];
-
-      [context completeBatchFetching:YES];
-
-      NSLog(@"kittens added");
-    });
-  });
 }
 
 @end
